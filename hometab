@@ -1,0 +1,3 @@
+#user:luks:path:x:fstype:mountopts
+#user:plain:path:size,offset,skip,device-size,hash,cipher,sector-size,key-size:fstype:mountopts
+#user:tmpfs:path:x:x:mountopts

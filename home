@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+# vim:ft=bash:noet:ts=3:sw=3:
+
+[[ -n "$DEBUG" ]] && set -x
+
+## Who am I?
+_SELF="${0##*/}"
+
+## home entries
+# format: UID -> ENTRY
+declare -A _HOMETAB
+
+## $1: exit code (defaults to 0)
+## $2: unknown option
+_usage() {
+	local __usage_text
+	local __exit_code="${1:-0}"
+	local __unknown_option="$2"
+	IFS='' read -r -d '' __usage_text <<ENDUSAGETEXT
+Usage: $_SELF OPERATION [UID]*
+
+  OPERATIONS:
+   unlock
+   mount
+   umount
+   lock
+
+  *: only if PAM_USER is defined
+
+  -h --help
+  --usage
+ENDUSAGETEXT
+	[[ -n "$__unknown_option" ]] && echo "$_SELF: invalid option -- '$__unknown_option'" >&2
+	printf "%s" "$__usage_text"
+	exit "$__exit_code"
+}
+
+## load '/etc/hometab' into '_HOMETAB'
+_load_hometab() {
+	local __hometab __line __uid
+	mapfile -t __hometab </etc/hometab
+
+	for __line in "${__hometab[@]}"
+	do
+		[[ "$__line" =~ ^#.+$ ]] && continue
+
+		__uid="$(id -u "${__line%%:*}")"
+		[[ -v "_HOMETAB[$__uid]" ]] && {
+			printf "$_SELF: /etc/hometab: duplicate entry found for '$__uid(%s)'\n" "$(id -nu "$__uid")" >&2
+			return 1
+		}
+
+		_HOMETAB[$__uid]="${__line#*:}"
+	done
+}
+
+## $1: device path
+_fsck_device() {
+	local __fsck_code
+	local __device="$1"
+
+	[[ -b "$__device" ]] || {
+		echo "$_SELF: $__device: no such block device" >&2
+		return 255
+	}
+
+	type -p fsck &>/dev/null || {
+		echo "$_SELF: fsck is not installed" >&2
+		return 255
+	}
+
+	fsck -Ta "$__device"
+	__fsck_code="$?"
+
+	((__fsck_code & 1)) && return
+
+	((__fsck_code & 2)) && echo "$_SELF: fsck: $__device: relogin required" >&2
+	((__fsck_code & 4)) && echo "$_SELF: fsck: $__device: failed, manual fsck required" >&2
+	((__fsck_code & 8)) && echo "$_SELF: fsck: $__device: failed, operational error" >&2
+	((__fsck_code & 16)) && echo "$_SELF: fsck: usage or syntax error" >&2
+	((__fsck_code & 32)) && echo "$_SELF: fsck: cancelled by user" >&2
+	((__fsck_code & 128)) && echo "$_SELF: fsck: shared library error" >&2
+
+	return "$__fsck_code"
+}
+
+## $1: user id
+_unlock() {
+	local __entry __plain_opts
+	local __uid="$1"
+	local IFS
+
+	[[ -v "_HOMETAB[$__uid]" ]] || return
+
+	IFS=':'
+	# (type path opts fstype mountopts)
+	__entry=(${_HOMETAB[$__uid]})
+	unset -v IFS
+
+	case "${__entry[0]}" in
+	luks)
+		if [[ ! -b "/dev/mapper/home-$__uid" ]]
+		then cryptsetup open "${__entry[1]}" "home-$__uid"
+		fi
+	;;
+	plain)
+		if [[ ! -b "/dev/mapper/home-$__uid" ]]
+		then
+			IFS=','
+			# (size offset skip device-size hash cipher sector-size key-size)
+			__plain_opts=(${__entry[2]})
+			unset -v IFS
+
+			if ((${#__plain_opts[@]} != 8))
+			then
+				echo "$_SELF: invalid amount of options, expected 8 but got ${#__plain_opts[@]}" >&2
+				return 1
+			fi
+
+			[[ "${__plain_opts[0]}" != 'x' ]] && __plain_opts[0]="--size=${__plain_opts[0]}"
+			[[ "${__plain_opts[1]}" != 'x' ]] && __plain_opts[1]="--offset=${__plain_opts[1]}"
+			[[ "${__plain_opts[2]}" != 'x' ]] && __plain_opts[2]="--skip=${__plain_opts[2]}"
+			[[ "${__plain_opts[3]}" != 'x' ]] && __plain_opts[3]="--device-size=${__plain_opts[3]}"
+			[[ "${__plain_opts[4]}" != 'x' ]] && __plain_opts[4]="--hash=${__plain_opts[4]}"        || __plain_opts[4]="--hash=sha256"
+			[[ "${__plain_opts[5]}" != 'x' ]] && __plain_opts[5]="--cipher=${__plain_opts[5]}"      || __plain_opts[5]="--cipher=aes-xts-essiv:sha256"
+			[[ "${__plain_opts[6]}" != 'x' ]] && __plain_opts[6]="--sector-size=${__plain_opts[6]}" || __plain_opts[6]="--sector-size=4096"
+			[[ "${__plain_opts[7]}" != 'x' ]] && __plain_opts[7]="--key-size=${__plain_opts[7]}"    || __plain_opts[7]="--key-size=256"
+
+			cryptsetup open --type=plain "${__entry[1]}" "${__plain_opts[@]}" "home-$__uid"
+		fi
+	;;
+	esac
+}
+
+## $1: user id
+_mount() {
+	local __hometab_entry __passwd_entry
+	local __uid="$1"
+	local IFS
+
+	[[ -v "_HOMETAB[$__uid]" ]] || return
+
+	IFS=':'
+	# (user shadow uid gid gecos homedir shell)
+	__passwd_entry=($(getent passwd "$__uid"))
+	# (type path opts fstype mountopts)
+	__hometab_entry=(${_HOMETAB[$__uid]})
+	unset -v IFS
+
+	if ! findmnt "/run/home/$__uid" &>/dev/null
+	then
+		case "${__hometab_entry[0]}" in
+		luks|plain)
+			if _fsck_device "/dev/mapper/home-$__uid"
+			then mount --mkdir -t "${__hometab_entry[3]}" -o "${__hometab_entry[4]}" "/dev/mapper/home-$__uid" "/run/home/$__uid"
+			fi
+		;;
+		tmpfs)
+			mount --mkdir -t tmpfs -o "${__hometab_entry[4]}" "home-$__uid" "/run/home/$__uid"
+			cp -af /etc/skel/. "/run/home/$__uid"
+			chown -R "nobody:nobody" "/run/home/$__uid"
+			chmod -R go='' "/run/home/$__uid"
+		;;
+		esac
+	fi
+
+	if findmnt "/run/home/$__uid" &>/dev/null && ! findmnt "${__passwd_entry[5]}" &>/dev/null
+	then mount --bind -o X-mount.idmap="u:65534:$__uid:1 g:65534:${__passwd_entry[3]}:1" "/run/home/$__uid" "${__passwd_entry[5]}"
+	fi
+}
+
+## $1: user id
+_umount() {
+	local __hometab_entry __passwd_entry
+	local __uid="$1"
+	local IFS
+
+	[[ -v "_HOMETAB[$__uid]" ]] || return
+
+	IFS=':'
+	# (user shadow uid gid gecos homedir shell)
+	__passwd_entry=($(getent passwd "$__uid"))
+	# (type path opts fstype mountopts)
+	__hometab_entry=(${_HOMETAB[$__uid]})
+	unset -v IFS
+
+
+	if findmnt "${__passwd_entry[5]}" &>/dev/null
+	then
+		case "${__hometab_entry[0]}" in
+		luks|plain|tmpfs) umount "${__passwd_entry[5]}" ;;
+		esac
+	fi
+
+	if findmnt "/run/home/$__uid" &>/dev/null
+	then umount "/run/home/$__uid"
+	fi
+}
+
+## $1: user id
+_lock() {
+	local __hometab_entry __passwd_entry
+	local __uid="$1"
+	local IFS
+
+	[[ -v "_HOMETAB[$__uid]" ]] || return
+
+	IFS=':'
+	# (user shadow uid gid gecos homedir shell)
+	__passwd_entry=($(getent passwd "$__uid"))
+	# (type path opts fstype mountopts)
+	__hometab_entry=(${_HOMETAB[$__uid]})
+	unset -v IFS
+
+	case "${__hometab_entry[0]}" in
+	luks|plain)
+		if [[ -b "/dev/mapper/home-$__uid" ]]
+		then
+			cryptsetup close "home-$__uid"
+			sysctl -q vm.drop_caches=3
+		fi
+	;;
+	esac
+}
+
+## $1: mode of operation
+## $2: user name or id
+_main() {
+	local __mode="$1"
+	local __uid="$(id -u "${2:-$PAM_USER}")"
+
+	[[ -v "_HOMETAB[$__uid]" ]] || return
+
+	case "$__mode" in
+	unlock) _unlock "$__uid" ;;
+	mount) _mount "$__uid" ;;
+	umount) _umount "$__uid" ;;
+	lock) _lock "$__uid" ;;
+	*)
+		echo "$_SELF: invalid mode of operation -- '$__mode'" >&2
+		_usage 2
+	;;
+	esac
+}
+
+## parse the options
+while true
+do
+	case "$1" in
+	''|-h|--help|--usage) _usage ;;
+	-*|--*) _usage 2 "$1" ;;
+	--) shift; break ;;
+	*) break ;;
+	esac
+done
+
+((EUID)) && {
+	echo "$_SELF: requires root privileges" >&2
+	exit 4
+}
+
+_load_hometab
+_main "$@"

@@ -1,0 +1,22 @@
+# vim:ft=systemd:
+
+[Unit]
+Description=Home Configuration for UID %i
+
+DefaultDependencies=no
+BindsTo=user@%i.service
+Conflicts=umount.target
+Before=user@%i.service umount.target
+
+[Service]
+Type=oneshot
+
+ExecStart=/usr/bin/home mount %i
+ExecStop=/usr/bin/home umount %i
+ExecStopPost=/usr/bin/home lock %i
+RemainAfterExit=yes
+
+Slice=user-%i.slice
+
+[Install]
+RequiredBy=user@%i.service
