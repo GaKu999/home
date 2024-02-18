@@ -165,7 +165,7 @@ _mount() {
 	fi
 
 	if findmnt "/run/home/$__uid" &>/dev/null && ! findmnt "${__passwd_entry[5]}" &>/dev/null
-	then mount --bind -o X-mount.idmap="u:65534:$__uid:1 g:65534:${__passwd_entry[3]}:1" "/run/home/$__uid" "${__passwd_entry[5]}"
+	then mount --bind -o X-mount.idmap="u:65534:$__uid:1 g:65534:${__passwd_entry[3]}:1 0:0:999" "/run/home/$__uid" "${__passwd_entry[5]}"
 	fi
 }
 
